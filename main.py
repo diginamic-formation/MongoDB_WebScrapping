@@ -6,8 +6,6 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta
 import time
 
-
-
 # MongoDB setup
 client = MongoClient('localhost', 27017)
 db = client['book_scraping']
@@ -28,6 +26,7 @@ Notre programme sera composé de x parties
                         enregistre ces elements dans tableaux 
 """
 
+
 # Function to scrape book URLs
 def scrape_urls():
     still_scrapping = True
@@ -35,7 +34,7 @@ def scrape_urls():
     while still_scrapping:
         response = None
         try:
-            #get url to scrap
+            # get url to scrap
             url_doc = get_url_to_scrap()
             if url_doc:
                 # extract the scope to respect
@@ -48,20 +47,28 @@ def scrape_urls():
                 # insert all urls found int the html page scrapped
                 insert_new_urls(url_doc, scope, soup)
                 # insert the page web content and differents important fields
-                insert_one_document(url_doc, response, soup)
-                # upadte the status of the url => set it on "scrapped"
-                collection_urls.update_one({'_id': url_doc['_id']},
+                if insert_one_document(url_doc, response, soup, scope):
+                    # upadte the status of the url => set it on "scrapped"
+                    collection_urls.update_one({'_id': url_doc['_id']},
                                            {'$set': {'status': 'scrapped', 'last_update': datetime.now()}})
+                else:
+                    print("Nombre de page scrappé atteint !")
+                    collection_urls.update_one({'_id': url_doc['_id']},
+                                               {'$set': {'status': 'too_many_pages', 'last_update': datetime.now()}})
+                    still_scrapping = False
             else:
                 still_scrapping = False
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             print(f"Une erreur s'est produite : {e}")
             collection_urls.update_one({'_id': url_doc['_id']},
-                                       {'$set': {'status': 'error_scrapping', 'last_update': datetime.now(),'next_scrap_date': datetime.now() + timedelta(minutes=10)}},
-                                       {"$inc": {"nombre_de_trentative": 1}})
+                                       {'$set': {'status': 'error_scrapping', 'last_update': datetime.now(),
+                                                 'next_scrap_date': datetime.now() + timedelta(minutes=10)},
+                                        "$inc": {"nombre_de_trentative": 1}})
         finally:
             if url_doc:
-                collection_logs.insert_one({'url': url_doc['url'], 'status': response.status_code, 'reason': response.reason,"last_update": datetime.now()})
+                collection_logs.insert_one(
+                    {'url': url_doc['url'], 'status': response.status_code, 'reason': response.reason,
+                     "last_update": datetime.now()})
 
 
 def get_url_to_scrap():
@@ -70,7 +77,8 @@ def get_url_to_scrap():
 
         # possible_urls, to check if there is a possible urls to scrap in case of there is no url_doc available immediately
         possible_urls = collection_urls.find_one({"$or": [{'status': 'to_be_scrapped'},
-                                                          {'status': 'error_scrapping','nombre_de_trentative': {"$lt": 10}},
+                                                          {'status': 'error_scrapping',
+                                                           'nombre_de_trentative': {"$lt": 10}},
                                                           {'status': 'being_scrapped'}]})
 
         # url_doc, contains the url to scrap, it is selected with the strategy :
@@ -78,18 +86,27 @@ def get_url_to_scrap():
         # urls with errors but it is possible to scrap it again ( next_scrap_date is reached)
         # urls being scrapped by another scrapper but it took more than 10 minutes (we consider there is some trouble with the other scrapper)
         url_doc = collection_urls.find_one_and_update({"$or": [{'status': 'to_be_scrapped'},
-                                                               {'status': 'error_scrapping','next_scrap_date': {"$lt": datetime.now()},'nombre_de_trentative': {"$lt": 10}},
-                                                               {'status': 'being_scrapped', 'last_update': {"$lt": datetime.now() - timedelta(minutes=10)}}]},
-                                                      {'$set': {'status': 'being_scrapped',"last_update": datetime.now()}})
+                                                               {'status': 'error_scrapping',
+                                                                'next_scrap_date': {"$lt": datetime.now()},
+                                                                'nombre_de_trentative': {"$lt": 10}},
+                                                               {'status': 'being_scrapped', 'last_update': {
+                                                                   "$lt": datetime.now() - timedelta(minutes=10)}}]},
+                                                      {'$set': {'status': 'being_scrapped',
+                                                                "last_update": datetime.now()}})
 
-        # Normal case :
-        # if we found an url, we stop waiting and start scraping this url
+        # if we found an url, we check if we reached the maximum of url scrapped
         if url_doc:
-            wait = False
+            # if we didn't reach the limit we continue the scrapping
+            if collection_data.count_documents({'scope':url_doc['scope']}) < 100:
+                return url_doc
+            #if we reach the limit we change the status of the url, and stop the scrapper 
+            else:
+                collection_urls.find_one_and_update({'url': url_doc['url']},{'$set': {'status': 'too_many_pages', "last_update": datetime.now()}})
+                return None
 
         # if there is no possible url to scrap, it is time to stop the scrapper
         if url_doc is None and possible_urls is None:
-            wait = False
+            return None
 
         # if there is no url to scrap immediately but there is possible ones, we can wait 10 seconds and retry again
         if url_doc is None and possible_urls:
@@ -98,22 +115,37 @@ def get_url_to_scrap():
 
     return url_doc
 
+
 """
 In this part
     We save the full html document 
     We extract each part (title, h1, h2, b, strong, em) 
     Save the the document with the its associated  url  
 """
-def insert_one_document(url_doc, response, soup):
-    title = soup.find('title').text
-    h1 = soup.find('h1').text
-    h2 = list(map(lambda x: x.text, soup.find_all('h2')))
-    b = list(map(lambda x: x.text, soup.find_all('b')))
-    em = list(map(lambda x: x.text, soup.find_all('em')))
-    strong = list(map(lambda x: x.text, soup.find_all('strong')))
-    collection_data.insert_one(
-        {'url': url_doc['url'], 'html': response.text, "title": title, "h1": h1, "h2": h2, "b": b, "em": em,
-         "strong": strong, "last_update": datetime.now()})
+
+
+def insert_one_document(url_doc, response, soup, scope):
+    nb_documents = collection_data.count_documents({})
+    print(nb_documents)
+    if nb_documents <= 100:
+        nouveau_doc = {
+            'url': url_doc['url'], 'html': response.text,
+            "title": soup.find('title').text,
+            "h1": list(map(lambda x: x.text, soup.find_all('h1'))),
+            "h2": list(map(lambda x: x.text, soup.find_all('h2'))),
+            "b": list(map(lambda x: x.text, soup.find_all('b'))),
+            "em": list(map(lambda x: x.text, soup.find_all('em'))),
+            "strong": list(map(lambda x: x.text, soup.find_all('strong'))),
+            "last_update": datetime.now(),
+            "scope": scope
+        }
+        collection_data.update_one(
+            {'url': url_doc['url']},
+            {"$setOnInsert": nouveau_doc},
+            upsert=True
+        )
+        return True
+    return False
 
 """
 To get new urls : 
@@ -123,6 +155,8 @@ To get new urls :
     test if we don't already get it in our collection_urls
     add them in the collection_urls 
 """
+
+
 def insert_new_urls(url_doc, scope, soup):
     for link in soup.find_all('a'):
         absolute_url = urllib.parse.urljoin(url_doc['url'], link['href'])
