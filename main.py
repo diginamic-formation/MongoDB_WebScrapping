@@ -15,24 +15,35 @@ collection_logs = db['logs']
 collection_urls = db['urls']
 collection_data = db['data']
 
+"""
+Notre programme sera composé de x parties 
+-- get_url_to_scrap, qui sera responsable de fournir une url à scrapper suivant les conditions qu'on s'est exigé pour qu'un url soit apte a être scrappé ou pas 
+-- insert_new_urls, qui sera responsable de chercher toutes les urls sur lesquelles pointe notre page scrappé, 
+                    vérifier si elles font partie du scope 
+                    vérifier si elles n'ont pas été déjà enregistré auparavant 
+                    les enregistrer avec un statut to_be_scrapped
+-- insert_one_document, cette partie partie 
+                        enregistre la page web (brute) 
+                        extrait les elements jugés importants (title, h1, h2, b , strong, em) 
+                        enregistre ces elements dans tableaux 
+"""
 
 # Function to scrape book URLs
 def scrape_urls():
-    # page_url = "page-1.html"
     still_scrapping = True
     print("Start scrapping !")
-    counter = 0
     while still_scrapping:
         response = None
         try:
+            #get url to scrap
             url_doc = get_url_to_scrap()
             if url_doc:
+                # extract the scope to respect
                 scope = url_doc['scope']
-                if counter == 0:
-                    print("Scope to scrap : ", scope)
-                counter += 1
                 print("scrapping : ", url_doc['url'])
+                # scrap the url
                 response = requests.get(url_doc['url'])
+                # use BeautifulSoup, to make it easy to parse the html document
                 soup = BeautifulSoup(response.content, 'html.parser')
                 # insert all urls found int the html page scrapped
                 insert_new_urls(url_doc, scope, soup)
@@ -45,15 +56,12 @@ def scrape_urls():
                 still_scrapping = False
         except Exception as e:
             print(f"Une erreur s'est produite : {e}")
-            collection_urls.update_one({'_id': url_doc['_id']}, {
-                '$set': {'status': 'error_scrapping', 'last_update': datetime.now(),
-                         'next_scrap_date': datetime.now() + timedelta(minutes=10)}},
+            collection_urls.update_one({'_id': url_doc['_id']},
+                                       {'$set': {'status': 'error_scrapping', 'last_update': datetime.now(),'next_scrap_date': datetime.now() + timedelta(minutes=10)}},
                                        {"$inc": {"nombre_de_trentative": 1}})
         finally:
             if url_doc:
-                collection_logs.insert_one(
-                    {'url': url_doc['url'], 'status': response.status_code, 'reason': response.reason,
-                     "last_update": datetime.now()})
+                collection_logs.insert_one({'url': url_doc['url'], 'status': response.status_code, 'reason': response.reason,"last_update": datetime.now()})
 
 
 def get_url_to_scrap():
@@ -68,13 +76,14 @@ def get_url_to_scrap():
         # url_doc, contains the url to scrap, it is selected with the strategy :
         # all the urls with status "to_be_scrapped", (never scrapped)
         # urls with errors but it is possible to scrap it again ( next_scrap_date is reached)
-        # urls being scrapped by another scrapper but il took more than 10 minutes (we consider there is some trouble with the other scrapper)
+        # urls being scrapped by another scrapper but it took more than 10 minutes (we consider there is some trouble with the other scrapper)
         url_doc = collection_urls.find_one_and_update({"$or": [{'status': 'to_be_scrapped'},
                                                                {'status': 'error_scrapping','next_scrap_date': {"$lt": datetime.now()},'nombre_de_trentative': {"$lt": 10}},
                                                                {'status': 'being_scrapped', 'last_update': {"$lt": datetime.now() - timedelta(minutes=10)}}]},
                                                       {'$set': {'status': 'being_scrapped',"last_update": datetime.now()}})
 
-        # if we foud an url, we stop waiting and strat scraping this url
+        # Normal case :
+        # if we found an url, we stop waiting and start scraping this url
         if url_doc:
             wait = False
 
@@ -82,14 +91,19 @@ def get_url_to_scrap():
         if url_doc is None and possible_urls is None:
             wait = False
 
-        # if the is no url to scrap immediately but there is possible ones, we can wait 10 seconds and retry again
+        # if there is no url to scrap immediately but there is possible ones, we can wait 10 seconds and retry again
         if url_doc is None and possible_urls:
             print("Waiting 10 seconds for possible urls")
             time.sleep(10)
 
     return url_doc
 
-
+"""
+In this part
+    We save the full html document 
+    We extract each part (title, h1, h2, b, strong, em) 
+    Save the the document with the its associated  url  
+"""
 def insert_one_document(url_doc, response, soup):
     title = soup.find('title').text
     h1 = soup.find('h1').text
@@ -101,7 +115,14 @@ def insert_one_document(url_doc, response, soup):
         {'url': url_doc['url'], 'html': response.text, "title": title, "h1": h1, "h2": h2, "b": b, "em": em,
          "strong": strong, "last_update": datetime.now()})
 
-
+"""
+To get new urls : 
+    We start searching all anchors <a> and parse all href links 
+    get absolute urls, if href contains relative url
+    test if the absolute url is in the scope 
+    test if we don't already get it in our collection_urls
+    add them in the collection_urls 
+"""
 def insert_new_urls(url_doc, scope, soup):
     for link in soup.find_all('a'):
         absolute_url = urllib.parse.urljoin(url_doc['url'], link['href'])
